@@ -52,13 +52,31 @@ pub fn merge_plugin_bindings(dest: &[u8], incoming: &[u8]) -> (Vec<u8>, usize) {
         return (incoming.to_vec(), added);
     }
 
-    let (Ok(dest_v), Ok(incoming_v)) = (
+    let (dest_v, incoming_v) = match (
         serde_json::from_slice::<Value>(dest),
         serde_json::from_slice::<Value>(incoming),
-    ) else {
-        // `incoming` did not parse: it may be a truncated or crashed write,
-        // so it must not wipe a valid `dest`.
-        return (dest.to_vec(), 0);
+    ) {
+        (Ok(d), Ok(i)) => (d, i),
+        (Err(_), Ok(_)) => {
+            // `dest` did not parse: unusable as a merge base, so a valid
+            // `incoming` (the only side that parses) wins verbatim. Returning
+            // the corrupt `dest` would lock the corruption in: every push
+            // would re-broadcast it, every pull would re-classify it as
+            // unchanged against the (also corrupt) base, and a user with a
+            // hand-broken or partially-written local file would never
+            // recover via a normal sync.
+            return (incoming.to_vec(), 0);
+        }
+        (Ok(_), Err(_)) => {
+            // `incoming` did not parse: a truncated or crashed write must
+            // never wipe a valid `dest`.
+            return (dest.to_vec(), 0);
+        }
+        (Err(_), Err(_)) => {
+            // Both sides are unparseable: nothing we can do safely; leave
+            // `dest` as-is and report no merge.
+            return (dest.to_vec(), 0);
+        }
     };
     let Some(dest_map) = dest_v.as_object() else {
         // `dest` is not a JSON object: unusable as a merge base, incoming wins.
@@ -215,6 +233,33 @@ mod tests {
         let valid = bindings(&[("a@dir", "github.com/o/r#plugins/a")]);
         let (merged, _) = merge_plugin_bindings(b"[1,2]", &valid);
         assert_eq!(merged, valid);
+    }
+
+    #[test]
+    fn an_unparseable_dest_is_replaced_by_a_valid_incoming() {
+        // A dest that does not parse (truncated write, hand-broken JSON, fs
+        // corruption) must not lock the corruption in: a valid `incoming`
+        // replaces it verbatim. Otherwise the corruption propagates to the
+        // repo on the next push and survives every pull (the apply sees
+        // the corrupt local matches the corrupt base and treats it as
+        // unchanged).
+        let valid = bindings(&[("a@dir", "github.com/o/r#plugins/a")]);
+        let corrupt_dest = b"not json at all";
+        let (merged, added) = merge_plugin_bindings(corrupt_dest, &valid);
+        assert_eq!(merged, valid, "corrupt dest is replaced by valid incoming");
+        assert_eq!(added, 0);
+    }
+
+    #[test]
+    fn both_sides_corrupt_keeps_dest_intact() {
+        // Both unparseable: the merge cannot proceed; dest stays, no
+        // count. Avoids the previous bug where this case and the
+        // corrupt-dest-but-valid-incoming case collapsed to the same
+        // return value.
+        let corrupt = b"not json at all";
+        let (merged, added) = merge_plugin_bindings(corrupt, corrupt);
+        assert_eq!(merged, corrupt);
+        assert_eq!(added, 0);
     }
 
     #[test]

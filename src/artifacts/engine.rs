@@ -24,15 +24,22 @@ use super::tracked::{self, TrackedPaths};
 use super::union_jsonl::merge_history_lines;
 use crate::later_timestamps::keep_later_timestamps;
 
+/// A union-merge function: bytewise takes `(dest, incoming)` and returns
+/// `(merged_bytes, new_entries_count)`. Used in `union_for` and called from
+/// the push, plan, and apply paths.
+type UnionMergeFn = fn(&[u8], &[u8]) -> (Vec<u8>, usize);
+
 /// For one merge strategy and one file's path, the union-merge function to
 /// apply — or `None` (raw overwrite / no union). Adding a union strategy
 /// is one registry variant plus one arm here; every engine path (push,
 /// plan, apply) routes through this table, so no call site can drift
 /// from the others.
-fn union_for(merge: MergeStrategy, rel: &Path) -> Option<fn(&[u8], &[u8]) -> (Vec<u8>, usize)> {
+fn union_for(merge: MergeStrategy, rel: &Path) -> Option<UnionMergeFn> {
     match merge {
         MergeStrategy::UnionMemoryIndex if is_memory_index(rel) => Some(merge_memory_index),
-        MergeStrategy::UnionPluginBindings if is_plugin_bindings(rel) => Some(merge_plugin_bindings),
+        MergeStrategy::UnionPluginBindings if is_plugin_bindings(rel) => {
+            Some(merge_plugin_bindings)
+        }
         _ => None,
     }
 }
@@ -818,8 +825,7 @@ pub fn push_artifacts(
                         if existed {
                             match fs::read(&dest) {
                                 Ok(dest_bytes) => {
-                                    let (merged, new_entries) =
-                                        merge_fn(&dest_bytes, &src_bytes);
+                                    let (merged, new_entries) = merge_fn(&dest_bytes, &src_bytes);
                                     pending_entries = new_entries;
                                     src_bytes = merged;
                                 }
