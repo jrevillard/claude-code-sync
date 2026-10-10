@@ -14,7 +14,8 @@ use crate::scm::Backend;
 
 use super::bases::{self, BaseHashes};
 use super::denylist::{is_denied, is_unsafe_rel_path};
-use super::memory_index::{is_memory_index, merge_memory_index_checked};
+use super::memory_index::{is_memory_index, merge_memory_index, merge_memory_index_checked};
+use super::plugin_bindings::{is_plugin_bindings, merge_plugin_bindings};
 use super::registry::{
     CategoryDescriptor, CategoryId, DestRoot, MergeStrategy, SourceSpec, ARTIFACTS_SUBDIR, REGISTRY,
 };
@@ -22,6 +23,21 @@ use super::tokens::PathTokens;
 use super::tracked::{self, TrackedPaths};
 use super::union_jsonl::merge_history_lines;
 use crate::later_timestamps::keep_later_timestamps;
+
+/// For one merge strategy and one file's path, the union-merge function to
+/// apply — or `None` (raw overwrite / no union). Adding a union strategy
+/// is one registry variant plus one arm here; every engine path (push,
+/// plan, apply) routes through this table, so no call site can drift
+/// from the others.
+fn union_for(merge: MergeStrategy, rel: &Path) -> Option<fn(&[u8], &[u8]) -> (Vec<u8>, usize)> {
+    match merge {
+        MergeStrategy::UnionMemoryIndex if is_memory_index(rel) => Some(merge_memory_index),
+        MergeStrategy::UnionPluginBindings if is_plugin_bindings(rel) => {
+            Some(merge_plugin_bindings)
+        }
+        _ => None,
+    }
+}
 
 /// Whether one category participates for this configuration: toggles for the
 /// regular categories, the (inverted) attachments flag for ProjectAttachments.
@@ -56,6 +72,7 @@ pub(crate) fn records_base(strategy: MergeStrategy, _rel: &Path) -> bool {
         MergeStrategy::RawOverwrite => true,
         MergeStrategy::UnionJsonl => false,
         MergeStrategy::UnionMemoryIndex => true,
+        MergeStrategy::UnionPluginBindings => true,
     }
 }
 
@@ -834,7 +851,9 @@ pub fn push_artifacts(
                         counts.unchanged += 1;
                     }
                 }
-                MergeStrategy::UnionMemoryIndex | MergeStrategy::RawOverwrite => {
+                MergeStrategy::UnionMemoryIndex
+                | MergeStrategy::UnionPluginBindings
+                | MergeStrategy::RawOverwrite => {
                     // Never fatal, matching the pull side: an unreadable
                     // local file is held back and warned, so a bad file
                     // cannot wedge every later sync behind one error.
@@ -846,8 +865,7 @@ pub fn push_artifacts(
                         }
                     };
                     let existed = dest.is_file();
-                    let unions_index =
-                        desc.merge == MergeStrategy::UnionMemoryIndex && is_memory_index(&file.rel);
+                    let union_merge = union_for(desc.merge, &file.rel);
                     // Hashed before `read_bytes` moves into `src_bytes`: the
                     // base record stores the LOCAL bytes as pushed, per the
                     // one shared rule (see `records_base`).
@@ -863,45 +881,61 @@ pub fn push_artifacts(
                     // Merged lines count only once a write lands (see the
                     // jsonl arm): `pending_entries` rides to the write.
                     let mut pending_entries = 0usize;
-                    if existed && unions_index {
-                        match fs::read(&dest) {
-                            Ok(dest_bytes) => {
-                                // Dangling-entry strip: deletions now
-                                // mirror, so an entry whose file exists on
-                                // no machine is stale (deleted, or a typo
-                                // target that never matched anything).
-                                // Fail-closed on listing errors — see
-                                // `memory_dir_targets`.
-                                let known =
-                                    match memory_dir_targets(file.abs.parent(), dest.parent()) {
-                                        Ok(set) => set,
-                                        Err(e) => {
-                                            hold_back(
-                                                &mut counts,
-                                                &file.abs,
-                                                "memory dir unreadable",
-                                                &e,
+                    if let Some(merge_fn) = union_merge {
+                        if existed {
+                            match fs::read(&dest) {
+                                Ok(dest_bytes) => {
+                                    if is_memory_index(&file.rel) {
+                                        // Dangling-entry strip: an entry
+                                        // whose file exists on no machine
+                                        // is stale (deleted, or a typo
+                                        // target that never matched
+                                        // anything). Fail-closed on
+                                        // listing errors — see
+                                        // `memory_dir_targets`.
+                                        let known = match memory_dir_targets(
+                                            file.abs.parent(),
+                                            dest.parent(),
+                                        ) {
+                                            Ok(set) => set,
+                                            Err(e) => {
+                                                hold_back(
+                                                    &mut counts,
+                                                    &file.abs,
+                                                    "memory dir unreadable",
+                                                    &e,
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        let (merged, new_entries, stripped) =
+                                            merge_memory_index_checked(
+                                                &dest_bytes,
+                                                &src_bytes,
+                                                &known,
                                             );
-                                            continue;
+                                        if stripped > 0 {
+                                            log::warn!(
+                                                "{}: dropped {} dangling index {} (no machine has the target file)",
+                                                file.rel.display(),
+                                                stripped,
+                                                if stripped == 1 { "entry" } else { "entries" },
+                                            );
+                                            counts.stripped_entries += stripped;
                                         }
-                                    };
-                                let (merged, new_entries, stripped) =
-                                    merge_memory_index_checked(&dest_bytes, &src_bytes, &known);
-                                if stripped > 0 {
-                                    log::warn!(
-                                        "{}: dropped {} dangling index {} (no machine has the target file)",
-                                        file.rel.display(),
-                                        stripped,
-                                        if stripped == 1 { "entry" } else { "entries" },
-                                    );
-                                    counts.stripped_entries += stripped;
+                                        pending_entries = new_entries;
+                                        src_bytes = merged;
+                                    } else {
+                                        let (merged, new_entries) =
+                                            merge_fn(&dest_bytes, &src_bytes);
+                                        pending_entries = new_entries;
+                                        src_bytes = merged;
+                                    }
                                 }
-                                pending_entries = new_entries;
-                                src_bytes = merged;
-                            }
-                            Err(e) => {
-                                hold_back(&mut counts, &file.abs, "repo copy unreadable", &e);
-                                continue;
+                                Err(e) => {
+                                    hold_back(&mut counts, &file.abs, "repo copy unreadable", &e);
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -1830,7 +1864,9 @@ pub fn plan_pull(claude_dir: &Path, repo_root: &Path, filter: &FilterConfig) -> 
                         plan.unchanged += 1;
                     }
                 }
-                MergeStrategy::UnionMemoryIndex if is_memory_index(&rel) => {
+                MergeStrategy::UnionMemoryIndex | MergeStrategy::UnionPluginBindings
+                    if union_for(desc.merge, &rel).is_some() =>
+                {
                     if !local_path.is_file() {
                         if deleted_here_since_sync(
                             desc,
@@ -1902,30 +1938,49 @@ pub fn plan_pull(claude_dir: &Path, repo_root: &Path, filter: &FilterConfig) -> 
                         }
                         continue;
                     }
-                    // Classification only — the apply re-derives the set
-                    // fresh and owns the counter. The plan must classify
-                    // with the strip applied or it promises a union the
-                    // apply then does not write (stripped == local).
-                    let known = match memory_dir_targets(local_path.parent(), repo_path.parent()) {
-                        Ok(set) => set,
-                        Err(e) => {
-                            log::warn!(
-                                "Skipping {} (memory dir unreadable): {e}",
-                                local_path.display()
-                            );
-                            plan.skipped += 1;
-                            continue;
+                    // Classification only — the apply re-derives the
+                    // set fresh and owns the counter. The plan must
+                    // classify with the strip applied or it promises a
+                    // union the apply then does not write (stripped ==
+                    // local).
+                    if is_memory_index(&rel) {
+                        let known =
+                            match memory_dir_targets(local_path.parent(), repo_path.parent()) {
+                                Ok(set) => set,
+                                Err(e) => {
+                                    log::warn!(
+                                        "Skipping {} (memory dir unreadable): {e}",
+                                        local_path.display()
+                                    );
+                                    plan.skipped += 1;
+                                    continue;
+                                }
+                            };
+                        let (merged, _, _) =
+                            merge_memory_index_checked(&local_bytes, &repo_bytes, &known);
+                        if merged != local_bytes {
+                            plan.unions.push(write);
+                        } else {
+                            plan.unchanged += 1;
                         }
-                    };
-                    let (merged, _, _) =
-                        merge_memory_index_checked(&local_bytes, &repo_bytes, &known);
-                    if merged != local_bytes {
-                        plan.unions.push(write);
+                    } else if let Some(merge_fn) = union_for(desc.merge, &rel) {
+                        let (merged, _) = merge_fn(&local_bytes, &repo_bytes);
+                        if merged != local_bytes {
+                            plan.unions.push(write);
+                        } else {
+                            plan.unchanged += 1;
+                        }
                     } else {
-                        plan.unchanged += 1;
+                        // Guard matched, so this branch is unreachable; the
+                        // next match arm (RawOverwrite-style) handles
+                        // non-matching paths.
+                        unreachable!()
                     }
                 }
-                MergeStrategy::UnionMemoryIndex | MergeStrategy::RawOverwrite => {
+                #[allow(unreachable_patterns)]
+                MergeStrategy::UnionMemoryIndex
+                | MergeStrategy::UnionPluginBindings
+                | MergeStrategy::RawOverwrite => {
                     if !local_path.is_file() {
                         if deleted_here_since_sync(
                             desc,
@@ -3310,8 +3365,9 @@ pub fn apply_pull(plan: &PullPlan, interactive: bool) -> Result<ArtifactReport> 
         } else {
             None
         };
-        let (merged, new_entries) = match desc.merge {
-            MergeStrategy::UnionMemoryIndex => {
+        let (merged, new_entries) = if let Some(merge_fn) = union_for(desc.merge, &write.repo_path)
+        {
+            if desc.merge == MergeStrategy::UnionMemoryIndex {
                 let known = index_known_targets
                     .as_ref()
                     .expect("UnionMemoryIndex arm implies the listing was built");
@@ -3327,39 +3383,40 @@ pub fn apply_pull(plan: &PullPlan, interactive: bool) -> Result<ArtifactReport> 
                     counts_for(&mut by_category, write.category).stripped_entries += stripped;
                 }
                 (merged, added)
+            } else {
+                merge_fn(&local_bytes, &repo_bytes)
             }
-            _ => {
-                // Strict UTF-8 decode — `from_utf8_lossy` would silently
-                // substitute invalid sequences with U+FFFD, corrupting
-                // binary or partial-encoding prompt-history content on
-                // every pull/push. An unreadable prompt-history must
-                // error out so the user can hand-recover, not silently
-                // rewrite the file with replacement characters.
-                let local_text = match std::str::from_utf8(&local_bytes) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!(
-                            "Skipping {} (local bytes not valid UTF-8; cannot union-merge): {e}",
-                            write.local_path.display()
-                        );
-                        skip_unfinished_write(&mut by_category, &mut report, write);
-                        continue;
-                    }
-                };
-                let repo_text = match std::str::from_utf8(&repo_bytes) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!(
-                            "Skipping {} (repo bytes not valid UTF-8; cannot union-merge): {e}",
-                            write.local_path.display()
-                        );
-                        skip_unfinished_write(&mut by_category, &mut report, write);
-                        continue;
-                    }
-                };
-                let (text, lines) = merge_history_lines(local_text, repo_text);
-                (text.into_bytes(), lines)
-            }
+        } else {
+            // Strict UTF-8 decode — `from_utf8_lossy` would silently
+            // substitute invalid sequences with U+FFFD, corrupting
+            // binary or partial-encoding prompt-history content on
+            // every pull/push. An unreadable prompt-history must
+            // error out so the user can hand-recover, not silently
+            // rewrite the file with replacement characters.
+            let local_text = match std::str::from_utf8(&local_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!(
+                        "Skipping {} (local bytes not valid UTF-8; cannot union-merge): {e}",
+                        write.local_path.display()
+                    );
+                    skip_unfinished_write(&mut by_category, &mut report, write);
+                    continue;
+                }
+            };
+            let repo_text = match std::str::from_utf8(&repo_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!(
+                        "Skipping {} (repo bytes not valid UTF-8; cannot union-merge): {e}",
+                        write.local_path.display()
+                    );
+                    skip_unfinished_write(&mut by_category, &mut report, write);
+                    continue;
+                }
+            };
+            let (text, lines) = merge_history_lines(local_text, repo_text);
+            (text.into_bytes(), lines)
         };
         if let Err(e) = write_atomic(&write.local_path, &merged, &write.repo_path) {
             log::warn!(
