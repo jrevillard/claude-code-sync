@@ -75,6 +75,16 @@ enum Commands {
         /// Show minimal quiet output
         #[arg(short, long, conflicts_with = "verbose")]
         quiet: bool,
+
+        /// Override the 5ff1d62 push guard for specific paths: drops them
+        /// from the local tracked record before this push, so the next
+        /// push publishes them as fresh `Added` instead of holding them
+        /// back because the remote lost them. The path must currently be
+        /// in the held-back set (run `claude-code-sync status
+        /// --held-back` to list). Repo-relative paths (e.g.
+        /// `projects/-home-x/memory/feedback_x.md`).
+        #[arg(long, value_name = "PATH")]
+        resurrect: Vec<String>,
     },
 
     /// Pull and merge history from the sync repository
@@ -144,6 +154,14 @@ enum Commands {
         /// Show which files would be synced
         #[arg(long)]
         show_files: bool,
+
+        /// Show the files the 5ff1d62 push guard would refuse to
+        /// re-publish: per-machine, repo-relative paths that are present
+        /// locally, absent from the remote, AND in the local tracked
+        /// record. These are the files `push --resurrect <path>` can
+        /// override. Read-only — does not perform a push.
+        #[arg(long)]
+        held_back: bool,
     },
 
     /// Delete transcripts past the retention window, here and in the sync repo
@@ -228,6 +246,10 @@ enum Commands {
         /// e.g. "phpstorm merge". Pass an empty string to clear it.
         #[arg(long)]
         merge_tool: Option<String>,
+
+        /// Start each per-file prompt on `merge` when the merge tool is offered
+        #[arg(long, value_name = "BOOL")]
+        prefer_merge_tool: Option<bool>,
 
         /// Retention window for `purge`, in days (default: the longer of 180
         /// and this machine's Claude Code cleanupPeriodDays)
@@ -544,6 +566,7 @@ fn main() -> Result<()> {
             interactive,
             verbose,
             quiet,
+            resurrect,
         } => {
             // Determine verbosity level
             let verbosity = if verbose {
@@ -561,6 +584,8 @@ fn main() -> Result<()> {
                 exclude_attachments,
                 interactive,
                 verbosity,
+                &std::collections::HashSet::new(),
+                &resurrect,
             )?;
         }
         Commands::Pull {
@@ -579,7 +604,13 @@ fn main() -> Result<()> {
                 VerbosityLevel::Normal
             };
 
-            sync::pull_history(fetch_remote, branch.as_deref(), interactive, verbosity)?;
+            sync::pull_history(
+                fetch_remote,
+                branch.as_deref(),
+                interactive,
+                verbosity,
+                false,
+            )?;
         }
         Commands::Sync {
             message,
@@ -609,8 +640,9 @@ fn main() -> Result<()> {
         Commands::Status {
             show_conflicts,
             show_files,
+            held_back,
         } => {
-            sync::show_status(show_conflicts, show_files)?;
+            sync::show_status(show_conflicts, show_files, held_back)?;
         }
         Commands::Purge {
             older_than,
@@ -636,6 +668,7 @@ fn main() -> Result<()> {
             unmap_project,
             warn_each_skipped_file,
             merge_tool,
+            prefer_merge_tool,
             purge_older_than,
             purge_after_sync,
             show,
@@ -661,6 +694,7 @@ fn main() -> Result<()> {
                 || !unmap_project.is_empty()
                 || warn_each_skipped_file.is_some()
                 || merge_tool.is_some()
+                || prefer_merge_tool.is_some()
                 || purge_older_than.is_some()
                 || purge_after_sync.is_some()
                 || show
@@ -690,6 +724,9 @@ fn main() -> Result<()> {
                 }
                 if let Some(command) = merge_tool {
                     filter::set_merge_tool(&command)?;
+                }
+                if let Some(prefer) = prefer_merge_tool {
+                    filter::set_prefer_merge_tool(prefer)?;
                 }
                 if purge_older_than.is_some() || purge_after_sync.is_some() {
                     filter::configure_purge(purge_older_than, purge_after_sync)?;

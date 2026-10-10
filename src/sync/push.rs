@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
 use inquire::Confirm;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::artifacts::registry::CategoryId;
 use crate::filter::FilterConfig;
 use crate::history::{
     ConversationSummary, OperationHistory, OperationRecord, OperationType, SyncOperation,
@@ -153,6 +154,7 @@ pub fn plan_push(
 }
 
 /// Push local Claude Code history to sync repository
+#[allow(clippy::too_many_arguments)]
 pub fn push_history(
     commit_message: Option<&str>,
     push_remote: bool,
@@ -160,6 +162,8 @@ pub fn push_history(
     exclude_attachments: bool,
     interactive: bool,
     verbosity: crate::VerbosityLevel,
+    skip_artifact_paths: &HashSet<(CategoryId, PathBuf)>,
+    resurrect: &[String],
 ) -> Result<PushReport> {
     use crate::VerbosityLevel;
 
@@ -169,12 +173,42 @@ pub fn push_history(
 
     let state = SyncState::load()?;
     let repo = scm::open(&state.sync_repo_path)?;
+    let merge_is_unfinished = repo.has_unfinished_merge();
+    if merge_is_unfinished {
+        anyhow::bail!(
+            "The sync repository has a merge an interrupted pull left unfinished. \
+             Run `claude-code-sync pull` to settle or undo it first."
+        );
+    }
     let mut filter = FilterConfig::load()?;
+
+    // 5ff1d62 escape hatch: drop the listed paths from the local tracked
+    // record BEFORE the push runs, so the push's guard at engine.rs:711-735
+    // sees no tracked entry and publishes the file as a fresh `Added`.
+    // `engine::prepare_resurrection` returns Err if any path is not in the
+    // current record — defense in depth against a typo in the flag value
+    // or a path that was never held back. The user-facing discovery is
+    // `claude-code-sync status --held-back`.
+    if !resurrect.is_empty() {
+        let claude_dir = claude_projects_dir()?;
+        crate::artifacts::engine::prepare_resurrection(
+            &claude_dir,
+            &state.sync_repo_path,
+            resurrect,
+        )?;
+    }
 
     // Override exclude_attachments if specified in command
     if exclude_attachments {
         filter.exclude_attachments = true;
     }
+
+    // A `kept_local` (or `kept_local_delete`) file from the previous
+    // pull is held back per-file: the push's `push_artifacts` consults
+    // the `skip_artifact_paths` set and does not touch the repo copy
+    // for any entry. Other files in the same category (and other
+    // categories entirely) are unaffected — the held file is one
+    // surgical skip, not a category-wide hold.
 
     // Set up LFS if enabled
     if filter.enable_lfs {
@@ -279,6 +313,7 @@ pub fn push_history(
         &claude_home_dir()?,
         &state.sync_repo_path,
         &filter,
+        skip_artifact_paths,
     )?;
     crate::artifacts::engine::ensure_ignore_files(&state.sync_repo_path, filter.backend()?)?;
 
@@ -299,14 +334,54 @@ pub fn push_history(
             total_with_cwd
         );
         if !artifact_report.counts.is_empty() {
-            println!(
-                "  {} Artifacts: {} added, {} modified, {} deleted, {} unchanged",
-                "•".cyan(),
-                artifact_report.total_added(),
-                artifact_report.total_modified(),
-                artifact_report.total_deleted(),
-                artifact_report.total_unchanged()
-            );
+            // "skipped" (unreadable / over-size / refused), NOT "held
+            // back" — the pull's banner owns that word for the
+            // per-file skip set, and files the skip set held count as
+            // unchanged here. Two labels, two sets.
+            let held_back_remote_lost = artifact_report.total_held_back_remote_lost();
+            if held_back_remote_lost > 0 {
+                println!(
+                    "  {} Artifacts: {} added, {} modified, {} deleted, {} unchanged, {} skipped, {} held back (remote lost)",
+                    "•".cyan(),
+                    artifact_report.total_added(),
+                    artifact_report.total_modified(),
+                    artifact_report.total_deleted(),
+                    artifact_report.total_unchanged(),
+                    artifact_report.total_skipped(),
+                    held_back_remote_lost,
+                );
+                // List the actual file paths so the user can target them
+                // with `push --resurrect <path>`. Capped to 20 with a
+                // trailing "... and N more" to match the verbose list
+                // style used elsewhere in the push summary.
+                let held_back_list: Vec<&PathBuf> = artifact_report
+                    .held_back_paths()
+                    .map(|(_, path, _)| path)
+                    .collect();
+                let shown = held_back_list.len().min(20);
+                if shown > 0 {
+                    println!(
+                        "    {} Files the remote lost (use `claude-code-sync push --resurrect <path>` to override):",
+                        "→".cyan()
+                    );
+                    for path in &held_back_list[..shown] {
+                        println!("      {}", path.display());
+                    }
+                    if held_back_list.len() > shown {
+                        println!("      ... and {} more", held_back_list.len() - shown);
+                    }
+                }
+            } else {
+                println!(
+                    "  {} Artifacts: {} added, {} modified, {} deleted, {} unchanged, {} skipped",
+                    "•".cyan(),
+                    artifact_report.total_added(),
+                    artifact_report.total_modified(),
+                    artifact_report.total_deleted(),
+                    artifact_report.total_unchanged(),
+                    artifact_report.total_skipped(),
+                );
+            }
         }
         println!();
     }
@@ -336,9 +411,8 @@ pub fn push_history(
 
     // Interactive confirmation
     if interactive && interactive_conflict::is_interactive() {
-        let confirm = Confirm::new("Do you want to proceed with pushing these changes?")
+        let confirm = Confirm::new("Push?")
             .with_default(true)
-            .with_help_message("This will commit and push to the sync repository")
             .prompt()
             .context("Failed to get confirmation")?;
 

@@ -143,13 +143,33 @@ block in the repo's `.gitignore` (or `.hgignore`) as defense in depth.
 
 ### Conflict policy and undo
 
-Artifact pulls are **remote-wins**: a file is only written when its bytes
-differ, every overwritten local file is snapshotted first, and files the pull
-creates are recorded so `claude-code-sync undo pull` is an exact inverse
-(restores overwritten bytes, deletes created files). Interactive pulls
-(`pull --interactive`) confirm each overwrite per file. `history.jsonl` is
-never overwritten — both push and pull merge the union of lines, so prompt
-history only ever grows.
+**A pull only takes what the other machine changed.** Each machine records
+the version of every artifact it last synced (`~/.claude/.claude-code-sync-bases.json`),
+so a pull compares three versions — this machine's, the repository's, and the
+last synced one:
+
+| Since the last sync | Pull does |
+|---|---|
+| Only the other machine changed it | takes the repository version |
+| Only this machine changed it | leaves it; the push (or the push half of `sync`) publishes it |
+| This machine deleted it (skills, agents, commands, rules, hooks) | leaves it deleted; the push removes it |
+| The other machine deleted it, this machine edited it | keeps the edit |
+| Both changed it, and only date-times differ | keeps the later dates |
+| Both changed it | **keeps this machine's version and holds it back** from the push, so neither edit is lost. `pull --interactive` offers take / keep / merge (with a [merge tool](#external-merge-tool)) / keep both |
+| This machine never synced this repository | takes the repository version |
+
+A non-interactive pull never discards a version that exists only on this
+machine, and `sync` never publishes this machine's version over a change the
+other machine made. Every overwritten local file is still snapshotted first,
+and files the pull creates are recorded, so `claude-code-sync undo pull` is an
+exact inverse. `history.jsonl` is never overwritten — both push and pull merge
+the union of lines, so prompt history only ever grows.
+
+When both machines committed different versions of a file to the sync
+repository itself, a pull no longer stops for good: a file whose versions
+differ only in date-times keeps the later ones, and in a terminal every other
+file asks which version to keep. Without a terminal the merge is undone and
+nothing is written.
 
 > **Note (Git LFS):** if your `lfs_patterns` include `*.jsonl`, the repo copy
 > of `history.jsonl` is LFS-tracked; content is materialized on checkout, so
@@ -271,17 +291,23 @@ own commit, so `git` still has everything until the history itself is rewritten.
 
 ### External merge tool
 
-When a pulled file differs from the local one, `pull --interactive` offers to
-open a real three-way merge instead of only choosing a side:
+**Add a merge option to the per-file prompt** — on a file
+both machines changed in the sync repository, and on a pulled file that
+differs under `pull --interactive`:
 
 ```bash
 claude-code-sync config --merge-tool "phpstorm merge"
+claude-code-sync config --prefer-merge-tool true   # prompt starts on merge
 ```
 
-The tool is invoked as `<merge_tool> <local> <remote> <base> <output>` (the
-JetBrains argument order); whatever it writes to `<output>` is what lands. The
-base pane is empty — an artifact has no recorded common ancestor. Set
-`CLAUDE_CODE_SYNC_MERGE_TIMEOUT_SECONDS` to change the 15-minute wait, or pass
+The tool runs as `<merge_tool> <local> <remote> <base> <output>` (JetBrains
+argument order). What it saves to `<output>` lands, even when that is the local
+version unchanged.
+
+- Both machines changed it → `<base>` is the version both started from.
+- Pulled file differs → `<base>` is empty; nothing records an ancestor.
+
+Set `CLAUDE_CODE_SYNC_MERGE_TIMEOUT_SECONDS` to change the 15-minute wait. Pass
 an empty string to `--merge-tool` to go back to the terminal picker.
 
 ### Binaries per tag
@@ -602,10 +628,13 @@ claude-code-sync pull [OPTIONS]
 
 **Options:**
 - `--fetch-remote <BOOL>`: Pull from remote before merging (default: true).
-  A remote that cannot be reached or whose changes conflict with the local sync
-  repository stops the pull — diverged branches are merged automatically, and a
-  real conflict is reported and undone. Pass `--fetch-remote false` to merge
-  only what is already in the local sync repository.
+  Diverged branches merge on their own. A file both machines changed only in
+  date-times (`lastUpdated`, `modified: …`) keeps the later dates, no prompt.
+  Any other file both changed asks, per file: take the other machine's version,
+  keep this machine's, merge (the [merge tool](#external-merge-tool)), or stop.
+  Stopping, or no terminal to ask in, undoes the merge and stops the
+  pull, as does a remote that cannot be reached. Pass `--fetch-remote false` to
+  merge only what is already in the local sync repository.
 - `--branch, -b <BRANCH>`: Branch to pull from (default: current branch)
 
 **Example:**
@@ -948,12 +977,12 @@ Project: my-project
 Local:  45 messages, last modified 2 hours ago (15.2 KB)
 Remote: 52 messages, last modified 1 hour ago (18.5 KB)
 
-How do you want to resolve this conflict?
-❯ Smart Merge (combine both versions - recommended)
-  Keep Local Version (discard remote)
-  Keep Remote Version (overwrite local)
-  Keep Both (save remote with conflict suffix)
-  View Detailed Comparison
+Resolve:
+❯ smart merge
+  local
+  remote
+  both (remote saved as a copy)
+  details
 ```
 
 ### Automatic Resolution (Non-Interactive)
@@ -1016,8 +1045,11 @@ purge_after_sync = false
 # Warn once per file a pull cannot place, instead of one combined warning
 warn_each_skipped_file = false
 
-# External three-way merge command offered when a pulled file differs
+# External three-way merge command offered when a file differs or conflicts
 merge_tool = "phpstorm merge"
+
+# Start each per-file prompt on `merge` when the merge tool is offered
+prefer_merge_tool = false
 
 # Artifact categories to sync alongside conversation history
 # (all default to false; see the Artifact Sync section)

@@ -9,7 +9,7 @@ use super::discovery::{claude_projects_dir, discover_sessions};
 use super::state::SyncState;
 
 /// Show sync status
-pub fn show_status(show_conflicts: bool, show_files: bool) -> Result<()> {
+pub fn show_status(show_conflicts: bool, show_files: bool, held_back: bool) -> Result<()> {
     let state = SyncState::load()?;
     let repo = scm::open(&state.sync_repo_path)?;
     let filter = FilterConfig::load()?;
@@ -84,11 +84,21 @@ pub fn show_status(show_conflicts: bool, show_files: bool) -> Result<()> {
             let differing = plan
                 .overwrites
                 .iter()
+                .chain(plan.date_settles.iter())
+                .chain(plan.local_only.iter())
+                .chain(plan.deleted_here.iter())
                 .chain(plan.creates.iter())
                 .chain(plan.unions.iter())
                 .chain(plan.mode_fixes.iter())
+                .chain(plan.kept_local.iter())
                 .filter(|w| w.category == desc.id)
-                .count();
+                .count()
+                + plan
+                    .deletes
+                    .iter()
+                    .chain(plan.kept_local_deletes.iter())
+                    .filter(|d| d.category == desc.id)
+                    .count();
             if differing == 0 {
                 println!("  {}: {}", desc.name, "in sync".green());
             } else {
@@ -98,6 +108,22 @@ pub fn show_status(show_conflicts: bool, show_files: bool) -> Result<()> {
                     format!("{differing} file(s) differ from sync repo").yellow()
                 );
             }
+        }
+        // Skipped files (over the size limit, unreadable) are outside sync
+        // but permanently divergent — "in sync" everywhere would hide that.
+        if plan.skipped > 0 {
+            println!(
+                "  {}: {}",
+                "skipped".yellow(),
+                format!(
+                    // Unmapped-project files DO increment plan.skipped
+                    // (and are also warned per project) — the taxonomy
+                    // must match the number.
+                    "{} file(s) skipped (size limit, unreadable, refused name, or unmapped project) — see logs",
+                    plan.skipped
+                )
+                .yellow()
+            );
         }
     } else {
         println!(
@@ -143,6 +169,43 @@ pub fn show_status(show_conflicts: bool, show_files: bool) -> Result<()> {
             } else {
                 println!("{}", "No conflicts in last sync".green());
             }
+        }
+    }
+
+    // Held-back files (5ff1d62 push guard): only printed when explicitly
+    // requested. Drives the `push --resurrect <path>` discovery flow
+    // without performing a push. Read-only — does not touch the tracked
+    // record or the repo.
+    if held_back {
+        println!();
+        println!("{}", "Files the 5ff1d62 push guard would refuse:".bold());
+        let held = crate::artifacts::engine::plan_held_back_remote_lost(
+            &claude_dir,
+            &state.sync_repo_path,
+            &filter,
+        )?;
+        if held.is_empty() {
+            println!("  (none)");
+        } else {
+            // Group by category for readability. HashMap (not BTreeMap)
+            // because CategoryId does not implement Ord.
+            use std::collections::HashMap;
+            let mut by_cat: HashMap<crate::artifacts::registry::CategoryId, Vec<&Path>> =
+                HashMap::new();
+            for (cat, path) in &held {
+                by_cat.entry(*cat).or_default().push(path.as_path());
+            }
+            for (cat, paths) in &by_cat {
+                println!("  {}:", format!("{:?}", cat).bold());
+                for path in paths {
+                    println!("    {}", path.display());
+                }
+            }
+            println!();
+            println!(
+                "To republish any of these on the next push, run:\n  \
+                 claude-code-sync push --resurrect <path>"
+            );
         }
     }
 
