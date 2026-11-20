@@ -1,15 +1,20 @@
 //! Union merge for `MEMORY.md` memory indexes.
 //!
-//! An index is one line per memory (`- [Title](file.md) — hook`), listing what
-//! that machine knows about. Overwriting would let a sparser index orphan
-//! another machine's memory files, so both directions union instead: entries
-//! are keyed by link target, the incoming side wins per entry, and entries the
-//! destination lacks are appended.
+//! An index lists what that machine knows about; a line may carry one
+//! pointer (`- [Title](file.md) — hook`) or bundle several of them.
+//! Overwriting would let a sparser index orphan another machine's memory
+//! files, so both directions union instead: a line's identity is its full
+//! set of link targets. An incoming line supersedes a destination line
+//! only when it covers ALL of the destination line's pointers (and, for
+//! a single-link destination, is itself single-link — a bundle merely
+//! containing the pointer appends instead of swallowing the curated
+//! hook text). Every other incoming entry line is appended unless its
+//! exact text is already present.
 //!
-//! The destination keeps its own headings, blank lines, prose and entry order,
-//! since this rewrites a hand-edited file. Only entry lines cross between
-//! machines. Merging only adds or updates a line, so repeating it changes
-//! nothing and two machines converge.
+//! The destination keeps its own headings, blank lines, prose and entry
+//! order, since this rewrites a hand-edited file. Only entry lines cross
+//! between machines. Merging only adds or supersedes, so repeating it
+//! changes nothing and two machines converge.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -17,7 +22,8 @@ use std::path::{Path, PathBuf};
 /// The file name whose contents are union-merged rather than overwritten.
 pub const MEMORY_INDEX_FILE: &str = "MEMORY.md";
 
-/// One line of an index: an entry carries the link target it is keyed by.
+/// One line of an index: an entry carries every link target the line
+/// references (one, or a whole bundle on a compacted line).
 enum IndexLine {
     Entry { targets: Vec<String>, text: String },
     Other(String),
@@ -69,14 +75,6 @@ fn parse(text: &str) -> Vec<IndexLine> {
         .collect()
 }
 
-/// Merge `incoming` into `dest`, returning the merged text and how many entries
-/// `incoming` contributed that `dest` did not have.
-/// Whether union-merging `incoming` over `dest` keeps every line of
-/// `dest`. The merge is grow-only across entries but incoming-wins per
-/// target key, so two sides that only ADD entries converge losslessly,
-/// while a shared key with different text would clobber the dest side's
-/// edited bullet. The pull consults this before routing a diverged
-/// index: converge when nothing is lost, hold when something is.
 pub fn union_preserves_dest_lines(dest: &[u8], incoming: &[u8]) -> bool {
     let (merged, _) = merge_memory_index(dest, incoming);
     let merged_text = String::from_utf8_lossy(&merged);
@@ -86,6 +84,10 @@ pub fn union_preserves_dest_lines(dest: &[u8], incoming: &[u8]) -> bool {
         .all(|line| merged_text.lines().any(|m| m == line))
 }
 
+/// Merge `incoming` into `dest`, returning the merged text and how many
+/// entry lines `incoming` contributed beyond what `dest` already held
+/// (verbatim or superseded). Every link pointer present on either side
+/// ends up present in the merge.
 pub fn merge_memory_index(dest: &[u8], incoming: &[u8]) -> (Vec<u8>, usize) {
     let dest_lines = parse(&String::from_utf8_lossy(dest));
     let incoming_lines = parse(&String::from_utf8_lossy(incoming));
@@ -127,8 +129,15 @@ pub fn merge_memory_index(dest: &[u8], incoming: &[u8]) -> (Vec<u8>, usize) {
                                 ..
                             } => {
                                 // incoming COVERS dest: every dest pointer
-                                // is present in the incoming line
+                                // is present in the incoming line. A
+                                // single-link dest line is a hand-written
+                                // entry with curated text — only an
+                                // exact single-link match supersedes it;
+                                // a bundle merely CONTAINING the pointer
+                                // must append instead of swallowing the
+                                // note.
                                 targets.iter().all(|t| inc_targets.contains(t))
+                                    && (targets.len() > 1 || inc_targets.len() == 1)
                             }
                             IndexLine::Other(_) => false,
                         }
@@ -150,12 +159,11 @@ pub fn merge_memory_index(dest: &[u8], incoming: &[u8]) -> (Vec<u8>, usize) {
         merged.push('\n');
     }
 
-    // Incoming entries not used as replacements are appended when they
-    // bring at least one pointer the merged text does not have yet, and
-    // are not byte-identical to a line already there. A single-link line
-    // whose pointer is covered but whose text differs still arrives —
-    // the edit must be visible — which is the appended-line form of the
-    // incoming-wins contract.
+    // Incoming entries not used as replacements are appended unless
+    // byte-identical to a line already there. A single-link line whose
+    // pointer is covered by a bundle but whose text differs still
+    // arrives — the edit must be visible — which is the appended-line
+    // form of the incoming-wins contract.
     let mut added = 0;
     for (i, line) in incoming_lines.iter().enumerate() {
         if used_for_replacement[i] {
@@ -927,5 +935,80 @@ mod strip_grouped_tests {
         );
         assert!(text.contains("alive.md"));
         assert_eq!(dropped, 2);
+    }
+}
+
+#[cfg(test)]
+mod review_fixes_tests {
+    use super::*;
+
+    #[test]
+    fn a_bundle_line_never_replaces_a_single_link_entry() {
+        // A single-link line is a hand-written entry with curated hook
+        // text. An incoming bundle merely CONTAINING that pointer must
+        // not swallow the note: the entry survives, the bundle is
+        // appended, no pointer is lost.
+        let dest = b"- [b](b.md) IMPORTANT NOTE\n";
+        let incoming = b"- [a](a.md) - also [b](b.md)\n";
+        let (merged, _) = merge_memory_index(dest, incoming);
+        let text = String::from_utf8(merged).unwrap();
+        assert!(
+            text.contains("IMPORTANT NOTE"),
+            "the hook text survives: {text}"
+        );
+        assert!(
+            text.contains("a.md") && text.contains("b.md"),
+            "all pointers present: {text}"
+        );
+    }
+
+    #[test]
+    fn a_covering_bundle_still_replaces_a_grouped_line() {
+        // The lossless replacement stays: a grouped dest line whose every
+        // pointer the incoming line carries is superseded (same bundle,
+        // evolved on the other machine) — without duplicating pointers.
+        let dest = b"- [bundle](a.md) - also [b](b.md)\n";
+        let incoming = b"- [bundle+](a.md) - also [b](b.md); plus [c](c.md)\n";
+        let (merged, _) = merge_memory_index(dest, incoming);
+        let text = String::from_utf8(merged).unwrap();
+        for needle in ["a.md", "b.md", "c.md"] {
+            assert!(
+                text.contains(needle),
+                "pointer survives: {needle} in {text}"
+            );
+        }
+        assert!(
+            text.matches("(a.md)").count() == 1,
+            "no duplicated pointer: {text}"
+        );
+    }
+
+    #[test]
+    fn merging_the_same_merged_output_again_changes_nothing() {
+        // The merge is idempotent on its own output — two machines
+        // converge to one fixed point and a second round is byte-stable.
+        let dest = b"# Index\n\n- [a](a.md) A\n- [b](b.md) B\n";
+        let incoming = b"# Index\n\n- [b](b.md) B\n- [c](c.md) C\n";
+        let (once, _) = merge_memory_index(dest, incoming);
+        let (twice, added) = merge_memory_index(&once, incoming);
+        assert_eq!(once, twice, "byte-stable second round");
+        assert_eq!(added, 0);
+    }
+
+    #[test]
+    fn a_replacement_never_dups_a_line_already_emitted() {
+        // The replaced line and a kept dest line can be byte-identical
+        // (an edit line + a bundle line the incoming bundle covers): the
+        // output carries the bundle line once.
+        let dest = b"- [edit](e.md) edit\n- [bundle](a.md) - also [b](b.md)\n";
+        let incoming = b"- [bundle](a.md) - also [b](b.md)\n";
+        let (merged, _) = merge_memory_index(dest, incoming);
+        let text = String::from_utf8(merged).unwrap();
+        assert_eq!(
+            text.matches("- [bundle](a.md) - also [b](b.md)").count(),
+            1,
+            "one bundle line, not two: {text}"
+        );
+        assert!(text.contains("edit"), "the edit line survives: {text}");
     }
 }
