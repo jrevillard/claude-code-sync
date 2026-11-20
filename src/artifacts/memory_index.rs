@@ -48,6 +48,21 @@ fn parse(text: &str) -> Vec<IndexLine> {
 
 /// Merge `incoming` into `dest`, returning the merged text and how many entries
 /// `incoming` contributed that `dest` did not have.
+/// Whether union-merging `incoming` over `dest` keeps every line of
+/// `dest`. The merge is grow-only across entries but incoming-wins per
+/// target key, so two sides that only ADD entries converge losslessly,
+/// while a shared key with different text would clobber the dest side's
+/// edited bullet. The pull consults this before routing a diverged
+/// index: converge when nothing is lost, hold when something is.
+pub fn union_preserves_dest_lines(dest: &[u8], incoming: &[u8]) -> bool {
+    let (merged, _) = merge_memory_index(dest, incoming);
+    let merged_text = String::from_utf8_lossy(&merged);
+    String::from_utf8_lossy(dest)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| merged_text.lines().any(|m| m == line))
+}
+
 pub fn merge_memory_index(dest: &[u8], incoming: &[u8]) -> (Vec<u8>, usize) {
     let dest_lines = parse(&String::from_utf8_lossy(dest));
     let incoming_lines = parse(&String::from_utf8_lossy(incoming));
@@ -387,5 +402,38 @@ mod tests {
         assert!(!text.contains("gone.md"));
         assert_eq!(added, 0);
         assert_eq!(stripped, 1);
+    }
+}
+
+#[cfg(test)]
+mod convergence_tests {
+    use super::*;
+
+    #[test]
+    fn a_union_that_only_adds_preserves_the_dest_lines() {
+        let dest = b"# Index\n\n- [a](a.md) A\n";
+        let incoming = b"# Index\n\n- [a](a.md) A\n- [b](b.md) B\n";
+        assert!(union_preserves_dest_lines(dest, incoming));
+    }
+
+    #[test]
+    fn a_union_that_clobbers_an_edited_entry_reports_it() {
+        // Same target key, different text: the merge is incoming-wins per
+        // key, so the dest side's edited bullet would be lost.
+        let dest = b"# Index\n\n- [a](a.md) edited here\n";
+        let incoming = b"# Index\n\n- [a](a.md) edited there\n";
+        assert!(!union_preserves_dest_lines(dest, incoming));
+    }
+
+    #[test]
+    fn identical_sides_preserve_each_other() {
+        let dest = b"# Index\n\n- [a](a.md) A\n";
+        assert!(union_preserves_dest_lines(dest, dest));
+    }
+
+    #[test]
+    fn an_empty_dest_has_nothing_to_lose() {
+        let incoming = b"# Index\n\n- [a](a.md) A\n";
+        assert!(union_preserves_dest_lines(b"", incoming));
     }
 }
